@@ -1,0 +1,97 @@
+name: Homelab deb
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the release already exists
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: advplyr/audiobookshelf
+  PATCH_BRANCH: feat/podcast-auto-download-filters
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: resolve upstream release and patch head
+        id: v
+        run: |
+          base=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          head=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY" "refs/heads/$PATCH_BRANCH" | cut -f1)
+          tag="homelab-$base-${head:0:8}"
+          { echo "base=$base"; echo "head=$head"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "${{ inputs.force }}" = true ]; then
+              gh release delete "$tag" -R "$GITHUB_REPOSITORY" -y --cleanup-tag
+            else
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "$tag already published"
+            fi
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.v.outputs.skip != 'true'
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.v.outputs.base }}
+          fetch-depth: 0
+
+      - name: apply patches on the release
+        if: steps.v.outputs.skip != 'true'
+        run: |
+          if grep -q autoDownloadMinDuration server/models/Podcast.js; then
+            echo "::error::$PATCH_BRANCH already ships in ${{ steps.v.outputs.base }}: switch back to the official package"
+            exit 1
+          fi
+          git config user.name homelab-ci
+          git config user.email homelab-ci@users.noreply.github.com
+          git fetch -q "https://github.com/$GITHUB_REPOSITORY" "$PATCH_BRANCH"
+          commits=$(git rev-list --reverse --no-merges FETCH_HEAD ^origin/master)
+          [ -n "$commits" ] || { echo "::error::$PATCH_BRANCH has no commit outside upstream master"; exit 1; }
+          git cherry-pick $commits
+          base=${{ steps.v.outputs.base }}
+          # The PR migration is named after the next release, so the build must claim at least that version.
+          version=$(echo "${base#v}" | awk -F. '{print $1"."$2"."$3+1}')
+          npm version --no-git-tag-version "$version"
+          (cd client && npm version --no-git-tag-version "$version")
+
+      - uses: actions/setup-node@v4
+        if: steps.v.outputs.skip != 'true'
+        with:
+          node-version: 24
+
+      - name: test
+        if: steps.v.outputs.skip != 'true'
+        run: npm ci && npm test
+
+      - name: build deb
+        if: steps.v.outputs.skip != 'true'
+        run: |
+          sudo apt-get install -y -qq fakeroot
+          npm install -g @yao-pkg/pkg
+          build/linuxpackager
+
+      - name: smoke test
+        if: steps.v.outputs.skip != 'true'
+        run: |
+          mkdir -p /tmp/abs/config /tmp/abs/metadata
+          CONFIG_PATH=/tmp/abs/config METADATA_PATH=/tmp/abs/metadata PORT=3333 \
+            dist/debian/usr/share/audiobookshelf/audiobookshelf &
+          for _ in $(seq 30); do curl -sf http://127.0.0.1:3333/healthcheck && break; sleep 2; done
+          curl -sf http://127.0.0.1:3333/healthcheck
+
+      - name: publish
+        if: steps.v.outputs.skip != 'true'
+        run: |
+          gh release create "${{ steps.v.outputs.tag }}" dist/*.deb -R "$GITHUB_REPOSITORY" --target master --latest \
+            --title "${{ steps.v.outputs.tag }}" \
+            --notes "Upstream ${{ steps.v.outputs.base }} + $PATCH_BRANCH@${{ steps.v.outputs.head }}"
